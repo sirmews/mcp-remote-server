@@ -1,246 +1,311 @@
-// declarative-mcp.ts
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
-  ListToolsRequestSchema,
-  CallToolRequestSchema,
-  ListResourcesRequestSchema,
-  ReadResourceRequestSchema,
-  ListPromptsRequestSchema,
-  GetPromptRequestSchema,
+	ListToolsRequestSchema,
+	CallToolRequestSchema,
+	ListResourcesRequestSchema,
+	ReadResourceRequestSchema,
+	ListPromptsRequestSchema,
+	GetPromptRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-interface ToolDefinition {
-  name: string;
-  description: string;
-  inputSchema: object;
-  handler: (args: any) => Promise<any>;
-}
-
-interface ResourceDefinition {
-  uri: string;
-  name: string;
-  description?: string;
-  mimeType?: string;
-  handler: () => Promise<string | Buffer>;
-}
-
-interface PromptDefinition {
-  name: string;
-  description: string;
-  arguments?: {
-    name: string;
-    description?: string;
-    required?: boolean;
-  }[];
-  handler: (args: any) => Promise<any>;
-}
-
+// Types for server configuration
 interface ServerConfig {
-  name: string;
-  version: string;
-  tools?: ToolDefinition[];
-  resources?: ResourceDefinition[];
-  prompts?: PromptDefinition[];
+	tools?: Array<{
+		name: string;
+		description: string;
+		inputSchema: object;
+		handler: string;
+	}>;
+	resources?: Array<{
+		uri: string;
+		name: string;
+		description?: string;
+		mimeType?: string;
+		handler: string;
+	}>;
+	prompts?: Array<{
+		name: string;
+		description: string;
+		arguments?: Array<{
+			name: string;
+			description?: string;
+			required?: boolean;
+		}>;
+		handler: string;
+	}>;
 }
 
-interface RemoteServerConfig extends ServerConfig {
-  controlPlaneUrl?: string;
-  refreshInterval?: number; // in milliseconds
+// Get control plane URL from args or env
+const controlPlaneUrl = process.argv[2] || process.env.MCP_CONTROL_PLANE_URL;
+if (!controlPlaneUrl) {
+	console.error(
+		"Please provide control plane URL as argument or set MCP_CONTROL_PLANE_URL",
+	);
+	process.exit(1);
 }
 
-export class DeclarativeMCPServer {
-  private server: Server;
-  private config: RemoteServerConfig;
-  private configRefreshInterval?: NodeJS.Timeout;
+export class RemoteMCPServer {
+	private server: Server;
+	private serverConfig?: ServerConfig;
+	private configRefreshInterval?: ReturnType<typeof setInterval>;
 
-  constructor(config: RemoteServerConfig) {
-    this.config = config;
-    this.server = new Server(
-      {
-        name: config.name,
-        version: config.version,
-      },
-      {
-        capabilities: {
-          tools: config.tools?.length ? {} : undefined,
-          resources: config.resources?.length ? {} : undefined,
-          prompts: config.prompts?.length ? {} : undefined,
-        },
-      }
-    );
+	constructor(private controlPlaneUrl: string) {
+		// Initialize server with base configuration
+		this.server = new Server(
+			{
+				name: "remote-mcp-server",
+				version: "0.1.0",
+			},
+			{
+				capabilities: {
+					tools: {},
+					resources: {},
+					prompts: {},
+					logging: {
+						supportedLevels: ["error", "warn", "info", "debug"],
+					},
+				},
+			},
+		);
+	}
 
-    this.registerTools();
-    this.registerResources();
-    this.registerPrompts();
-  }
+	/**
+	 * Fetches the config from the control plane
+	 * @returns The config
+	 */
+	private async fetchConfig(): Promise<ServerConfig> {
+		try {
+			const response = await fetch(this.controlPlaneUrl);
+			if (!response.ok) {
+				throw new Error(`Failed to fetch config: ${response.statusText}`);
+			}
+			return await response.json();
+		} catch (error) {
+			if (error instanceof Error) {
+				throw new Error(`Control plane error: ${error.message}`);
+			}
+			throw new Error("Control plane error: unknown error");
+		}
+	}
 
-  private registerTools() {
-    if (!this.config.tools?.length) return;
+	/**
+	 * Calls the remote handler
+	 * @param handlerUrl The URL of the handler
+	 * @param args The arguments to pass to the handler
+	 * @returns The result of the handler
+	 */
+	private async callRemoteHandler(
+		handlerUrl: string,
+		args?: Record<string, unknown>,
+	): Promise<any> {
+		try {
+			const response = await fetch(handlerUrl, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(args || {}),
+			});
 
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: this.config.tools!.map(tool => ({
-        name: tool.name,
-        description: tool.description,
-        inputSchema: tool.inputSchema,
-      })),
-    }));
+			// Log raw response text first
+			const rawText = await response.text();
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const tool = this.config.tools!.find(t => t.name === request.params.name);
-      if (!tool) {
-        throw new Error(`Tool not found: ${request.params.name}`);
-      }
+			if (!response.ok) {
+				this.server.sendLoggingMessage({
+					level: "error",
+					data: `Handler failed with status: ${response.status} ${response.statusText}`,
+				});
+				throw new Error(`Handler failed: ${response.statusText}`);
+			}
 
-      try {
-        const result = await tool.handler(request.params.arguments || {});
-        return {
-          content: [
-            {
-              type: "text",
-              text: typeof result === "string" ? result : JSON.stringify(result),
-            },
-          ],
-        };
-      } catch (error: any) {
-        throw new Error(`Tool execution failed: ${error.message}`);
-      }
-    });
-  }
+			const result = JSON.parse(rawText);
+			return result;
+		} catch (error) {
+			if (error instanceof Error) {
+				throw new Error(`Remote handler error: ${error.message}`);
+			}
+			throw new Error("Remote handler error: unknown error");
+		}
+	}
 
-  private registerResources() {
-    if (!this.config.resources?.length) return;
+	/**
+	 * Updates the server capabilities based on the config that was fetched
+	 * @param config The config to update the server capabilities with
+	 */
+	private async updateServerCapabilities(config: ServerConfig) {
+		// Register tools
+		if (config.tools?.length) {
+			this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+				tools: config.tools!.map((tool) => ({
+					name: tool.name,
+					description: tool.description,
+					inputSchema: tool.inputSchema,
+				})),
+			}));
 
-    this.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-      resources: this.config.resources!.map(resource => ({
-        uri: resource.uri,
-        name: resource.name,
-        description: resource.description,
-        mimeType: resource.mimeType,
-      })),
-    }));
+			this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+				const tool = config.tools!.find((t) => t.name === request.params.name);
+				if (!tool) {
+					throw new Error(`Tool not found: ${request.params.name}`);
+				}
 
-    this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-      const resource = this.config.resources!.find(r => r.uri === request.params.uri);
-      if (!resource) {
-        throw new Error(`Resource not found: ${request.params.uri}`);
-      }
+				try {
+					const result = await this.callRemoteHandler(
+						tool.handler,
+						request.params.arguments,
+					);
+					return {
+						content: [
+							{
+								type: "text",
+								text:
+									typeof result === "string"
+										? result
+										: JSON.stringify(result, null, 2),
+							},
+						],
+					};
+				} catch (error: any) {
+					throw new Error(`Tool execution failed: ${error.message}`);
+				}
+			});
+		}
 
-      try {
-        const content = await resource.handler();
-        return {
-          contents: [
-            {
-              uri: request.params.uri,
-              mimeType: resource.mimeType || "text/plain",
-              ...(Buffer.isBuffer(content)
-                ? { blob: content.toString("base64") }
-                : { text: content }),
-            },
-          ],
-        };
-      } catch (error: any) {
-        throw new Error(`Resource read failed: ${error.message}`);
-      }
-    });
-  }
+		// Register resources
+		if (config.resources?.length) {
+			this.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+				resources: config.resources!.map((resource) => ({
+					uri: resource.uri,
+					name: resource.name,
+					description: resource.description,
+					mimeType: resource.mimeType,
+				})),
+			}));
 
-  private registerPrompts() {
-    if (!this.config.prompts?.length) return;
+			this.server.setRequestHandler(
+				ReadResourceRequestSchema,
+				async (request) => {
+					const resource = config.resources!.find(
+						(r) => r.uri === request.params.uri,
+					);
+					if (!resource) {
+						throw new Error(`Resource not found: ${request.params.uri}`);
+					}
 
-    this.server.setRequestHandler(ListPromptsRequestSchema, async () => ({
-      prompts: this.config.prompts!.map(prompt => ({
-        name: prompt.name,
-        description: prompt.description,
-        arguments: prompt.arguments,
-      })),
-    }));
+					try {
+						const content = await this.callRemoteHandler(resource.handler);
+						return {
+							contents: [
+								{
+									uri: request.params.uri,
+									mimeType: resource.mimeType || "text/plain",
+									...(Buffer.isBuffer(content)
+										? { blob: content.toString("base64") }
+										: { text: content }),
+								},
+							],
+						};
+					} catch (error: any) {
+						throw new Error(`Resource read failed: ${error.message}`);
+					}
+				},
+			);
+		}
 
-    this.server.setRequestHandler(GetPromptRequestSchema, async (request) => {
-      const prompt = this.config.prompts!.find(p => p.name === request.params.name);
-      if (!prompt) {
-        throw new Error(`Prompt not found: ${request.params.name}`);
-      }
+		// Register prompts
+		if (config.prompts?.length) {
+			this.server.setRequestHandler(ListPromptsRequestSchema, async () => ({
+				prompts: config.prompts!.map((prompt) => ({
+					name: prompt.name,
+					description: prompt.description,
+					arguments: prompt.arguments,
+				})),
+			}));
 
-      try {
-        const result = await prompt.handler(request.params.arguments || {});
-        return {
-          messages: Array.isArray(result) ? result : [result],
-        };
-      } catch (error: any) {
-        throw new Error(`Prompt execution failed: ${error.message}`);
-      }
-    });
-  }
+			this.server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+				const prompt = config.prompts!.find(
+					(p) => p.name === request.params.name,
+				);
+				if (!prompt) {
+					throw new Error(`Prompt not found: ${request.params.name}`);
+				}
 
-  async start() {
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
-  }
+				try {
+					const result = await this.callRemoteHandler(
+						prompt.handler,
+						request.params.arguments,
+					);
+					const messages = Array.isArray(result)
+						? result
+						: [
+								{
+									role: "user",
+									content: {
+										type: "text",
+										text: result,
+									},
+								},
+							];
+					return { messages };
+				} catch (error: any) {
+					throw new Error(`Prompt execution failed: ${error.message}`);
+				}
+			});
+		}
+	}
+
+	/**
+	 * Refreshes the config from the control plane and updates the server capabilities
+	 */
+	private async refreshConfig() {
+		try {
+			const newConfig = await this.fetchConfig();
+
+			// Check if config has changed
+			// TODO: add a version and id to each config so this can be simplified
+			if (JSON.stringify(newConfig) !== JSON.stringify(this.serverConfig)) {
+				await this.updateServerCapabilities(newConfig);
+				this.serverConfig = newConfig;
+			}
+		} catch (error) {
+			console.error("Failed to refresh configuration:", error);
+		}
+	}
+
+	public async start() {
+		// Initial config setup
+		this.serverConfig = await this.fetchConfig();
+		await this.updateServerCapabilities(this.serverConfig);
+
+		// Connect transport first
+		const transport = new StdioServerTransport();
+		await this.server.connect(transport);
+
+		// Now that transport is connected, we can log
+		this.server.sendLoggingMessage({
+			level: "info",
+			data: "Transport connected, fetching initial configuration...",
+		});
+
+		// Setup refresh interval after connection
+		this.configRefreshInterval = setInterval(() => this.refreshConfig(), 60000);
+
+		this.server.sendLoggingMessage({
+			level: "info",
+			data: "Remote MCP Server initialized and ready",
+		});
+	}
+
+	/**
+	 * Stops the server.
+	 * TODO: look further into how to stop the server gracefully and clean up resources
+	 */
+	public async stop() {
+		if (this.configRefreshInterval) {
+			clearInterval(this.configRefreshInterval);
+		}
+	}
 }
 
-
-const weatherServer = new DeclarativeMCPServer({
-  name: "weather-server",
-  version: "1.0.0",
-  tools: [
-    {
-      name: "get-forecast",
-      description: "Get weather forecast for a location",
-      inputSchema: {
-        type: "object",
-        properties: {
-          latitude: {
-            type: "number",
-            description: "Latitude of the location",
-          },
-          longitude: {
-            type: "number",
-            description: "Longitude of the location",
-          },
-        },
-        required: ["latitude", "longitude"],
-      },
-      handler: async ({ latitude, longitude }) => {
-        // Implementation here
-        const response = await fetch(`https://api.weather.gov/points/${latitude},${longitude}`);
-        const data = await response.json();
-        return data;
-      },
-    },
-  ],
-  resources: [
-    {
-      uri: "weather://current-conditions",
-      name: "Current Weather Conditions",
-      description: "Live weather data",
-      mimeType: "application/json",
-      handler: async () => {
-        // Implementation here
-        return JSON.stringify({ temp: 72, conditions: "sunny" });
-      },
-    },
-  ],
-  prompts: [
-    {
-      name: "weather-analysis",
-      description: "Analyze weather patterns",
-      arguments: [
-        {
-          name: "location",
-          description: "Location to analyze",
-          required: true,
-        },
-      ],
-      handler: async ({ location }) => ({
-        role: "user",
-        content: {
-          type: "text",
-          text: `Analyzing weather patterns for ${location}...`,
-        },
-      }),
-    },
-  ],
-});
-
-weatherServer.start().catch(console.error);
+// Start server
+const server = new RemoteMCPServer(controlPlaneUrl);
+server.start().catch(console.error);

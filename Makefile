@@ -10,7 +10,7 @@ all: help
 
 ## inspect-local-server: Inspect the local MCP server
 inspect-local-server:
-	npx @modelcontextprotocol/inspector bun ./build/index.js
+	bunx @modelcontextprotocol/inspector bun run . https://gist.githubusercontent.com/sirmews/ce1cd66774b94e521608f72719d6a6fd/raw/2ea7fb935e87a181f2841bf32b408bb958cd9f42/mcp-example.json
 
 ## build: Build the project
 build:
