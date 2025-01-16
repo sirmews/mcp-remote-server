@@ -135,7 +135,7 @@ export class RemoteMCPServer {
 		// Register tools
 		if (config.tools?.length) {
 			this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-				tools: config.tools!.map((tool) => ({
+				tools: config.tools?.map((tool) => ({
 					name: tool.name,
 					description: tool.description,
 					inputSchema: tool.inputSchema,
@@ -143,7 +143,7 @@ export class RemoteMCPServer {
 			}));
 
 			this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-				const tool = config.tools!.find((t) => t.name === request.params.name);
+				const tool = config.tools?.find((t) => t.name === request.params.name);
 				if (!tool) {
 					throw new Error(`Tool not found: ${request.params.name}`);
 				}
@@ -164,8 +164,11 @@ export class RemoteMCPServer {
 							},
 						],
 					};
-				} catch (error: any) {
-					throw new Error(`Tool execution failed: ${error.message}`);
+				} catch (error: unknown) {
+					if (error instanceof Error) {
+						throw new Error(`Tool execution failed: ${error.message}`);
+					}
+					throw new Error("Tool execution failed: unknown error");
 				}
 			});
 		}
@@ -173,7 +176,7 @@ export class RemoteMCPServer {
 		// Register resources
 		if (config.resources?.length) {
 			this.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-				resources: config.resources!.map((resource) => ({
+				resources: config.resources?.map((resource) => ({
 					uri: resource.uri,
 					name: resource.name,
 					description: resource.description,
@@ -184,7 +187,7 @@ export class RemoteMCPServer {
 			this.server.setRequestHandler(
 				ReadResourceRequestSchema,
 				async (request) => {
-					const resource = config.resources!.find(
+					const resource = config.resources?.find(
 						(r) => r.uri === request.params.uri,
 					);
 					if (!resource) {
@@ -204,8 +207,11 @@ export class RemoteMCPServer {
 								},
 							],
 						};
-					} catch (error: any) {
-						throw new Error(`Resource read failed: ${error.message}`);
+					} catch (error: unknown) {
+						if (error instanceof Error) {
+							throw new Error(`Resource read failed: ${error.message}`);
+						}
+						throw new Error("Resource read failed: unknown error");
 					}
 				},
 			);
@@ -214,7 +220,7 @@ export class RemoteMCPServer {
 		// Register prompts
 		if (config.prompts?.length) {
 			this.server.setRequestHandler(ListPromptsRequestSchema, async () => ({
-				prompts: config.prompts!.map((prompt) => ({
+				prompts: config.prompts?.map((prompt) => ({
 					name: prompt.name,
 					description: prompt.description,
 					arguments: prompt.arguments,
@@ -222,7 +228,7 @@ export class RemoteMCPServer {
 			}));
 
 			this.server.setRequestHandler(GetPromptRequestSchema, async (request) => {
-				const prompt = config.prompts!.find(
+				const prompt = config.prompts?.find(
 					(p) => p.name === request.params.name,
 				);
 				if (!prompt) {
@@ -246,8 +252,11 @@ export class RemoteMCPServer {
 								},
 							];
 					return { messages };
-				} catch (error: any) {
-					throw new Error(`Prompt execution failed: ${error.message}`);
+				} catch (error: unknown) {
+					if (error instanceof Error) {
+						throw new Error(`Prompt execution failed: ${error.message}`);
+					}
+					throw new Error("Prompt execution failed: unknown error");
 				}
 			});
 		}
